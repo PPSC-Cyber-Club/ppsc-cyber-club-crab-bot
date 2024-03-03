@@ -2,6 +2,7 @@ mod commands;
 mod backend;
 
 
+use std::collections::HashMap;
 use regex::Regex;
 use tracing::error;
 use serde_json::json;
@@ -10,16 +11,19 @@ use serenity::async_trait;
 use serenity::model::gateway::Ready;
 use serenity::model::channel::Message;
 use backend::database_storage::Enrollment;
-use serenity::model::id::{ChannelId, GuildId, RoleId};
+use serenity::model::id::{ChannelId, GuildId};
 use serenity::model::application::interaction::{Interaction, InteractionResponseType};
-use std::ffi::OsStr;
-use std::str::FromStr;
+use serde_derive::Deserialize;
+use toml::de::Error;
 
 struct Bot;
 
-// parses environment variables T that meet the trait bounds into K which need to also meet the trait bounds
-fn parse_env<T, K: FromStr>(var: &T) -> K where T: AsRef<OsStr> + std::fmt::Debug + Sized  {
-    dotenv::var(var).unwrap().parse().unwrap_or_else(|_| panic!("{:?} not found / not integer", var))
+#[derive(Debug, Deserialize)]
+struct Data {
+    token: HashMap<String, String>,
+    guild: HashMap<String, u64>,
+    roles: HashMap<String, u64>,
+    channels: HashMap<String, u64>,
 }
 
 // takes in a mutable iterator of string literals '
@@ -33,14 +37,24 @@ fn parse_response<'a>(responses: &mut dyn Iterator<Item = &'a str>) -> &'a str {
         .trim_matches('"')
 }
 
+fn get_config() -> Result<Data, Error> {
+   let data = std::fs::read_to_string("config.toml").unwrap();
+    toml::from_str(&data)
+}
+
+fn get_roles(config: &Data) -> Vec<String> {
+    config.roles.keys()
+        .filter(|key| key.as_str() != REMOVE_ROLE_ID)
+        .map(|value| value.to_owned() )
+        .collect::<Vec<String>>()
+}
+
 // const env vars
 const DESTIN_CHANNEL_ID: &str = "DESTIN_CHANNEL_ID";
 const READING_CHANNEL_ID: &str = "READING_CHANNEL_ID";
 const ENROLL_CHANNEL_ID: &str = "ENROLL_CHANNEL_ID";
 const GUILD_ID: &str = "GUILD_ID";
-const DISCORD_TOKEN: &str = "DISCORD_TOKEN";
-const UNI_ONE_ID: &str = "uni_one_ID";
-const UNI_TWO_ID: &str = "uni_two_ID";
+const DISCORD_TOKEN: &str = "discord_token";
 const REMOVE_ROLE_ID: &str = "REMOVE_ROLE_ID";
 
 #[async_trait]
@@ -56,10 +70,12 @@ impl EventHandler for Bot {
             return
         }
 
+        let config = get_config().expect("using config.toml gave an error");
+
         // pull Channel Id environment vars from .env file
-        let destin_channel = ChannelId(parse_env(&DESTIN_CHANNEL_ID));
-        let reading_channel = ChannelId(parse_env(&READING_CHANNEL_ID));
-        let enroll_channel = ChannelId(parse_env(&ENROLL_CHANNEL_ID));
+        let destin_channel = ChannelId(*config.channels.get(DESTIN_CHANNEL_ID).expect("destin channel id not found"));
+        let reading_channel = ChannelId(*config.channels.get(READING_CHANNEL_ID).expect("reading channel id not found"));
+        let enroll_channel = ChannelId(*config.channels.get(ENROLL_CHANNEL_ID).expect("enroll channel id not found"));
 
 
         // set regular expression patterns for matching messages
@@ -89,9 +105,8 @@ impl EventHandler for Bot {
             let guild_id = msg.guild_id.unwrap();
 
             // pull env vars
-            let uni_one_id = RoleId(parse_env(&UNI_ONE_ID));
-            let uni_two_id = RoleId(parse_env(&UNI_TWO_ID));
-            let remove_id = RoleId(parse_env(&REMOVE_ROLE_ID));
+            let roles = get_roles(&config);
+            let remove_id = *config.roles.get(REMOVE_ROLE_ID).expect("Unable to find remove_id in config.toml");
 
             // Pull student responses from enrollment message
             // skips the first element in response iterator
@@ -103,20 +118,15 @@ impl EventHandler for Bot {
             let distro_response = parse_response(&mut response);
 
             // remove entry point role if uni_response matches "uni_one" or "uni_two"
-            if let "uni_one" | "uni_two" = uni_response {
-                if let Err(e) = guild_id.member(&ctx.http, user_id).await.unwrap().remove_role(&ctx.http, remove_id).await {
-                    error!("Error removing role: {:?}", e);
-                }
-
-                // add university student roles
-                if uni_response == "uni_one" {
-                    if let Err(e) = guild_id.member(&ctx.http, user_id).await.unwrap().add_role(&ctx.http, uni_one_id).await {
+            for role in roles {
+                if role == uni_response {
+                    if let Err(e) = guild_id.member(&ctx.http, user_id).await.unwrap().remove_role(&ctx.http, remove_id).await {
+                        error!("Error removing role: {:?}", e);
+                    }
+                    if let Err(e) = guild_id.member(&ctx.http, user_id).await.unwrap().add_role(&ctx.http, *config.roles.get(&role).expect("Unable to find role")).await {
                         error!("Error adding role: {:?}", e);
                     }
-                } else if uni_response == "uni_two" {
-                    if let Err(e) = guild_id.member(&ctx.http, user_id).await.unwrap().add_role(&ctx.http, uni_two_id).await {
-                        error!("Error adding role: {:?}", e);
-                    }
+                    break
                 }
             }
 
@@ -157,7 +167,8 @@ impl EventHandler for Bot {
         println!("{} is connected!", ready.user.name);
 
         // pull guild ID (discord server ID)
-        let guild_id = GuildId(parse_env(&GUILD_ID));
+        let config = get_config().expect("using config.toml gave an error");
+        let guild_id = GuildId(*config.guild.get(GUILD_ID).expect("Unable to find GUILD_ID in config.toml"));
 
         // create commands for given guild
         let commands = GuildId::set_application_commands(&guild_id, &ctx.http, |commands| {
@@ -202,16 +213,16 @@ impl EventHandler for Bot {
 
 #[tokio::main]
 async fn main() {
-
     // Configure the client with your Discord bot token in the environment.
-    let token: String = parse_env(&DISCORD_TOKEN);
+    let config = get_config().expect("using config.toml gave an error");
+    let token: &String = config.token.get(DISCORD_TOKEN).expect("Unable to find DISCORD_TOKEN in config.toml");
 
     // Set gateway intents, which decides what events the bot will be notified about
     let intents = GatewayIntents::GUILD_MESSAGES | GatewayIntents::MESSAGE_CONTENT |
         GatewayIntents::GUILD_MEMBERS | GatewayIntents::GUILDS;
 
     // Build our client.
-    let mut client = Client::builder(&token, intents)
+    let mut client = Client::builder(token, intents)
         .event_handler(Bot)
         .await
         .expect("Error creating client");
